@@ -124,6 +124,11 @@ func (b *Broker) Equity(marks map[string]decimal.Decimal) decimal.Decimal {
 	return b.quoteEq.Add(b.baseEq.Mul(marks[b.instID]))
 }
 
+// MinNotional 返回按 price 估算的最小下单金额（minSz × price）。
+func (b *Broker) MinNotional(price decimal.Decimal) decimal.Decimal {
+	return b.minSz.Mul(price)
+}
+
 // MarketOrder 用 IOC 限价单模拟市价单，价格偏离参考价不超过 slippage。
 func (b *Broker) MarketOrder(ctx context.Context, symbol string, side model.Side, qty, refPrice decimal.Decimal) (model.Fill, error) {
 	if symbol != b.instID {

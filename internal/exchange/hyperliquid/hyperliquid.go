@@ -127,8 +127,7 @@ func (c *Client) post(ctx context.Context, path string, body []byte, dst any) er
 }
 
 // SubscribeCandles 订阅实时 K 线。
-// Hyperliquid 的推送没有"已收盘"标记，所以当收到新一根 K 线（开盘时间变了）时，
-// 把上一根当作已收盘推出去。
+// Hyperliquid 的推送没有"已收盘"标记，收盘判断见下面的 closeTimer。
 func (c *Client) SubscribeCandles(ctx context.Context, symbol, interval string) (<-chan model.Candle, error) {
 	ch := make(chan model.Candle, 16)
 	sub, _ := json.Marshal(map[string]any{
@@ -164,34 +163,82 @@ func (c *Client) SubscribeCandles(ctx context.Context, symbol, interval string) 
 				}
 			}()
 
-			var current *hlCandle
-			for {
-				_, data, err := conn.Read(ctx)
-				if err != nil {
-					return err
-				}
-				var msg struct {
-					Channel string          `json:"channel"`
-					Data    json.RawMessage `json:"data"`
-				}
-				if err := json.Unmarshal(data, &msg); err != nil {
-					return fmt.Errorf("decode message: %w", err)
-				}
-				if msg.Channel != "candle" {
-					continue // subscriptionResponse、pong 等
-				}
-				var k hlCandle
-				if err := json.Unmarshal(msg.Data, &k); err != nil {
-					return fmt.Errorf("decode candle: %w", err)
-				}
-				if current != nil && k.OpenTime > current.OpenTime {
+			// 读消息放在单独的 goroutine 里，主循环才能同时等待"收盘计时器"
+			updates := make(chan hlCandle)
+			readErr := make(chan error, 1)
+			go func() {
+				for {
+					_, data, err := conn.Read(connCtx)
+					if err != nil {
+						readErr <- err
+						return
+					}
+					var msg struct {
+						Channel string          `json:"channel"`
+						Data    json.RawMessage `json:"data"`
+					}
+					if err := json.Unmarshal(data, &msg); err != nil {
+						readErr <- fmt.Errorf("decode message: %w", err)
+						return
+					}
+					if msg.Channel != "candle" {
+						continue // subscriptionResponse、pong 等
+					}
+					var k hlCandle
+					if err := json.Unmarshal(msg.Data, &k); err != nil {
+						readErr <- fmt.Errorf("decode candle: %w", err)
+						return
+					}
 					select {
-					case ch <- current.toModel():
-					case <-ctx.Done():
-						return ctx.Err()
+					case updates <- k:
+					case <-connCtx.Done():
+						return
 					}
 				}
-				current = &k
+			}()
+
+			// 一根 K 线在两种情况下视为收盘（以先到者为准）：
+			//   1. 收到了下一根 K 线的更新
+			//   2. 过了收盘时间 closeGrace 仍没有新更新（测试网成交稀少时很常见）
+			const closeGrace = 2 * time.Second
+			var current *hlCandle
+			var lastEmitted int64
+			closeTimer := time.NewTimer(time.Hour)
+			closeTimer.Stop()
+			emit := func() error {
+				if current == nil || current.OpenTime <= lastEmitted {
+					return nil
+				}
+				lastEmitted = current.OpenTime
+				select {
+				case ch <- current.toModel():
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			for {
+				select {
+				case err := <-readErr:
+					return err
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-closeTimer.C:
+					if err := emit(); err != nil {
+						return err
+					}
+				case k := <-updates:
+					if k.OpenTime <= lastEmitted {
+						continue // 已推送过的 K 线的迟到更新
+					}
+					if current != nil && k.OpenTime > current.OpenTime {
+						if err := emit(); err != nil {
+							return err
+						}
+					}
+					current = &k
+					closeTimer.Reset(time.Until(time.UnixMilli(k.CloseTime)) + closeGrace)
+				}
 			}
 		})
 	}()

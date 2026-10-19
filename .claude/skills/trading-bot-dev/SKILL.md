@@ -51,7 +51,10 @@ gofmt -l . && go vet ./... && go test -race ./...   # 每次改动后必跑
 go run ./cmd/bot -mode backtest -exchange okx -interval 1h -days 180
 go run ./cmd/bot -mode paper -exchange hyperliquid -interval 1m -fast 3 -slow 5
 HL_SIGN_CHECK=1 go test ./internal/exchange/hyperliquid -run Signature -v  # 联网验证签名
+go run ./cmd/bot -mode check -exchange hyperliquid -order 20   # 实盘前自检，不会成交
 ```
+
+- **用户报告实盘问题时，先让他们跑 `-mode check`**，按 ❌ 的那一项排查。check 和 live 用同一套端点（默认测试网/模拟盘）。Hyperliquid 的授权检查是一张价格为市价一半的 IOC 买单，交易所回复"无法立即成交"就说明签名和授权都没问题。
 
 - **验证实时链路**：用 1m 周期加很短的均线（`-fast 3 -slow 5`），后台运行约 2 分钟，然后发 SIGINT，检查有没有收到已收盘的 K 线、有没有正常退出：
   `./bin/bot ... > /tmp/x.log 2>&1 & p=$!; perl -e 'sleep 130'; kill -INT $p; wait; cat /tmp/x.log`

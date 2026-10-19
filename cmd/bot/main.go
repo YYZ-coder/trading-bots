@@ -42,7 +42,7 @@ type options struct {
 
 func main() {
 	var o options
-	flag.StringVar(&o.mode, "mode", "backtest", "运行模式：backtest（回测）| paper（实时模拟盘）| live（实盘，默认测试网）")
+	flag.StringVar(&o.mode, "mode", "backtest", "运行模式：backtest（回测）| paper（实时模拟盘）| check（检查实盘配置）| live（实盘，默认测试网）")
 	flag.StringVar(&o.exchange, "exchange", "okx", "交易所：okx | hyperliquid | binance（binance 只有行情，不能实盘）")
 	flag.StringVar(&o.symbol, "symbol", "", "交易品种，默认 okx=BTC-USDT，hyperliquid=BTC，binance=BTCUSDT")
 	flag.StringVar(&o.interval, "interval", "1h", "K 线周期，例如 1m 5m 15m 1h 4h 1d")
@@ -56,7 +56,7 @@ func main() {
 	flag.Float64Var(&o.fee, "fee", -1, "手续费率，默认 okx=0.001，hyperliquid=0.00045，binance=0.001")
 	flag.Float64Var(&o.slippageBps, "slippage-bps", 5, "回测/模拟盘的模拟滑点（基点，1 bp = 0.01%）")
 	flag.Float64Var(&o.maxSlippage, "max-slippage", 0.01, "实盘下单允许的最大滑点，0.01 = 1%")
-	flag.BoolVar(&o.mainnet, "mainnet", false, "实盘模式使用主网真实资金（默认用测试网/模拟盘）")
+	flag.BoolVar(&o.mainnet, "mainnet", false, "live/check 模式使用主网（默认用测试网/模拟盘）")
 	flag.BoolVar(&o.verbose, "v", false, "输出调试日志")
 	flag.Parse()
 
@@ -84,9 +84,8 @@ func main() {
 }
 
 func run(ctx context.Context, o options, log *slog.Logger) error {
-	live := o.mode == "live"
-	// 实盘默认走测试网/模拟盘；回测和模拟盘始终用主网行情
-	testnet := live && !o.mainnet
+	// 实盘和检查默认走测试网/模拟盘；回测和模拟盘始终用主网行情
+	testnet := (o.mode == "live" || o.mode == "check") && !o.mainnet
 
 	var md exchange.MarketData
 	var defaultSymbol string
@@ -176,6 +175,9 @@ func run(ctx context.Context, o options, log *slog.Logger) error {
 			log.Info("实盘模式（测试网/模拟盘，不涉及真实资金）")
 		}
 		return runRealtime(ctx, o, md, barDur, strat, broker, rm, log)
+
+	case "check":
+		return runCheck(ctx, o, md, barDur)
 
 	default:
 		return fmt.Errorf("未知模式 %q", o.mode)

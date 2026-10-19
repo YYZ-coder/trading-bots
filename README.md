@@ -18,8 +18,9 @@ go run ./cmd/bot -mode backtest -exchange hyperliquid -symbol ETH -interval 4h -
 # 实时模拟盘（真实行情 + 虚拟账户，不需要 API Key）
 go run ./cmd/bot -mode paper -exchange okx -interval 1m
 
-# 实盘（默认测试网/模拟盘，需要先配置 .env）
-cp .env.example .env   # 然后填写密钥
+# 实盘（默认测试网/模拟盘，需要先在 .env 里填好密钥）
+go run ./cmd/bot -mode check -exchange hyperliquid -order 20   # 先自检：密钥、行情、余额、签名授权（不会成交）
+go run ./cmd/bot -mode check -exchange okx -order 20
 go run ./cmd/bot -mode live -exchange hyperliquid -symbol BTC -interval 15m
 go run ./cmd/bot -mode live -exchange okx -symbol BTC-USDT -interval 15m
 
@@ -37,11 +38,13 @@ HL_SIGN_CHECK=1 go test ./internal/exchange/hyperliquid -run Signature -v   # �
 1. 在钱包（如 MetaMask）里**新建一个专用账户**，不要用存有真钱的钱包。
 2. 打开 https://app.hyperliquid-testnet.xyz 连接钱包，在 Faucet 领测试 USDC。
 3. 推荐：在 API 页面创建 **API 钱包**，把它的私钥填到 `HL_PRIVATE_KEY`，主账户地址填到 `HL_ACCOUNT_ADDRESS`。API 钱包只能交易，不能提币。
+4. 运行 `go run ./cmd/bot -mode check -exchange hyperliquid -order 20`，全部 ✅ 后再跑 live。
 
 **OKX 模拟盘**
 1. 登录 OKX → 交易 → 模拟交易，进入模拟盘。
 2. 在模拟盘里创建 API Key（和实盘 Key 分开），权限只勾"交易"。
 3. 把 Key、Secret、Passphrase 填到 `.env`。
+4. 运行 `go run ./cmd/bot -mode check -exchange okx -order 20`，全部 ✅ 后再跑 live。
 
 ## 安全设计
 

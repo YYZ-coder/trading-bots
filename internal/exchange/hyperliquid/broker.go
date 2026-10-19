@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -188,12 +189,43 @@ func (b *Broker) MarketOrder(ctx context.Context, symbol string, side model.Side
 	}
 	px = roundPrice(px, a.szDecimals)
 
+	filled, err := b.placeIOC(ctx, a, isBuy, px, size)
+	if err != nil {
+		return model.Fill{}, err
+	}
+
+	fill := model.Fill{
+		Symbol: symbol, Side: side, Time: time.Now(),
+		Qty: filled.TotalSz, Price: filled.AvgPx,
+		Fee: filled.TotalSz.Mul(filled.AvgPx).Mul(b.feeRate),
+	}
+	if !isBuy {
+		// 按开仓均价估算已实现盈亏（未计开仓手续费和资金费）
+		b.mu.Lock()
+		entry := b.positions[symbol].entryPx
+		b.mu.Unlock()
+		fill.RealizedPnL = fill.Price.Sub(entry).Mul(fill.Qty).Sub(fill.Fee)
+	}
+	return fill, nil
+}
+
+type iocFill struct {
+	TotalSz decimal.Decimal `json:"totalSz"`
+	AvgPx   decimal.Decimal `json:"avgPx"`
+	Oid     int64           `json:"oid"`
+}
+
+// errNoMatch 表示 IOC 订单签名和授权都没问题，只是没有对手盘可以立即成交。
+var errNoMatch = errors.New("没有可以立即成交的对手盘")
+
+// placeIOC 提交一张 IOC 限价单。卖单一律 reduceOnly（只平仓，不开空）。
+func (b *Broker) placeIOC(ctx context.Context, a asset, isBuy bool, px, size decimal.Decimal) (iocFill, error) {
 	action := orderAction{
 		Type: "order",
 		Orders: []orderWire{{
 			Asset: a.index, IsBuy: isBuy,
 			Price: px.String(), Size: size.String(),
-			ReduceOnly: !isBuy, // 卖出只用于平仓
+			ReduceOnly: !isBuy,
 			OrderType:  orderType{Limit: limitOrder{Tif: "Ioc"}},
 		}},
 		Grouping: "na",
@@ -204,47 +236,58 @@ func (b *Broker) MarketOrder(ctx context.Context, symbol string, side model.Side
 		Response json.RawMessage `json:"response"`
 	}
 	if err := b.postAction(ctx, action, &resp); err != nil {
-		return model.Fill{}, err
+		return iocFill{}, err
 	}
 	if resp.Status != "ok" {
-		return model.Fill{}, fmt.Errorf("hyperliquid 下单失败: %s", resp.Response)
+		return iocFill{}, fmt.Errorf("hyperliquid 下单失败: %s", resp.Response)
 	}
 	var data struct {
 		Data struct {
 			Statuses []struct {
-				Filled *struct {
-					TotalSz decimal.Decimal `json:"totalSz"`
-					AvgPx   decimal.Decimal `json:"avgPx"`
-					Oid     int64           `json:"oid"`
-				} `json:"filled"`
-				Error string `json:"error"`
+				Filled *iocFill `json:"filled"`
+				Error  string   `json:"error"`
 			} `json:"statuses"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(resp.Response, &data); err != nil {
-		return model.Fill{}, fmt.Errorf("hyperliquid 下单响应解析失败: %w (%s)", err, resp.Response)
+		return iocFill{}, fmt.Errorf("hyperliquid 下单响应解析失败: %w (%s)", err, resp.Response)
 	}
 	if len(data.Data.Statuses) == 0 {
-		return model.Fill{}, fmt.Errorf("hyperliquid 下单响应为空: %s", resp.Response)
+		return iocFill{}, fmt.Errorf("hyperliquid 下单响应为空: %s", resp.Response)
 	}
 	st := data.Data.Statuses[0]
-	if st.Filled == nil {
-		return model.Fill{}, fmt.Errorf("hyperliquid 订单未成交: %s", st.Error)
+	if st.Filled != nil {
+		return *st.Filled, nil
 	}
+	if strings.Contains(strings.ToLower(st.Error), "immediately match") {
+		return iocFill{}, fmt.Errorf("hyperliquid 订单未成交: %w", errNoMatch)
+	}
+	return iocFill{}, fmt.Errorf("hyperliquid 订单未成交: %s", st.Error)
+}
 
-	fill := model.Fill{
-		Symbol: symbol, Side: side, Time: time.Now(),
-		Qty: st.Filled.TotalSz, Price: st.Filled.AvgPx,
-		Fee: st.Filled.TotalSz.Mul(st.Filled.AvgPx).Mul(b.feeRate),
+// CheckAuth 验证签名和交易授权，不会产生成交：
+// 提交一张价格只有参考价一半的 IOC 买单，交易所回复"无法立即成交"即说明一切正常。
+// 只允许在测试网使用。
+func (b *Broker) CheckAuth(ctx context.Context, symbol string, refPrice decimal.Decimal) error {
+	if !b.c.testnet {
+		return errors.New("CheckAuth 只能在测试网使用")
 	}
-	if !isBuy {
-		// 按开仓均价估算已实现盈亏（未计开仓手续费和资金费）
-		b.mu.Lock()
-		entry := b.positions[symbol].entryPx
-		b.mu.Unlock()
-		fill.RealizedPnL = fill.Price.Sub(entry).Mul(fill.Qty).Sub(fill.Fee)
+	a, ok := b.assets[symbol]
+	if !ok {
+		return fmt.Errorf("hyperliquid 没有这个永续合约: %q", symbol)
 	}
-	return fill, nil
+	px := roundPrice(refPrice.Div(decimal.NewFromInt(2)), a.szDecimals)
+	// 名义金额要满足 10 美元的最小下单额，这里取 12 美元
+	size := decimal.NewFromInt(12).Div(px).RoundUp(a.szDecimals)
+	_, err := b.placeIOC(ctx, a, true, px, size)
+	switch {
+	case errors.Is(err, errNoMatch):
+		return nil
+	case err == nil:
+		return errors.New("检查单意外成交了，请到测试网检查持仓")
+	default:
+		return err
+	}
 }
 
 // postAction 签名并提交一个交易 action 到 /exchange。
