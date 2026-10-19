@@ -1,0 +1,11 @@
+# 密钥：绝对不要提交
+.env
+*.key
+
+# 编译产物和数据
+/bin/
+/data/
+*.db
+
+# Claude Code 本机个人设置
+.claude/settings.local.json
